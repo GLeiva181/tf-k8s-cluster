@@ -1,3 +1,4 @@
 credenciales
 *.tfstate
 *.tfstate.backup
+kubeconfig
