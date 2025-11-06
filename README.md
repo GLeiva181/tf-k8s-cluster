@@ -1,1 +1,1 @@
-# tf-k8s-cluster
+alias k="kubectl --insecure-skip-tls-verify=true"

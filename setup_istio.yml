@@ -1,0 +1,170 @@
+- hosts: all
+  become: true
+  tasks:
+    - name: Actualizar paquetes
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    - name: Instalar dependencias
+      apt:
+        name:
+          - apt-transport-https
+          - curl
+        state: present
+
+    - name: Instalar containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Configurar containerd
+      shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+        systemctl restart containerd
+
+    - name: Agregar repositorio de Kubernetes
+      shell: |
+        # Verificar si la clave GPG ya está instalada
+        if [ ! -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg ]; then
+          curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        fi
+        # Verificar si el repositorio ya está en la lista
+        if ! grep -q 'https://pkgs.k8s.io/core:/stable:/v1.30/deb/' /etc/apt/sources.list.d/kubernetes.list; then
+          echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list
+        fi
+        apt update
+
+    - name: Instalar kubelet, kubeadm, kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Mantener versiones de Kubernetes
+      shell: apt-mark hold kubelet kubeadm kubectl
+
+    - name: Deshabilitar swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^(.*)$/#\\1/g' /etc/fstab
+
+    - name: Cargar módulos del kernel
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Configurar parámetros de red
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+      notify: Aplicar sysctl
+
+  handlers:
+    - name: Aplicar sysctl
+      command: sysctl --system
+
+- hosts: control_plane
+  become: true
+  tasks:
+      - name: Verificar si Kubernetes ya está inicializado
+        stat:
+          path: /etc/kubernetes/admin.conf
+        register: k8s_initialized
+
+      - name: Inicializar Kubernetes en el master
+        command: kubeadm init --pod-network-cidr=10.244.0.0/16
+        register: k8s_init
+        when: not k8s_initialized.stat.exists
+
+      - name: Guardar salida del token
+        copy:
+          content: "{{ k8s_init.stdout_lines }}"
+          dest: /home/ubuntu/kubeadm_init.txt
+        when: not k8s_initialized.stat.exists
+
+      - name: Crear directorio de configuración de kubectl
+        file:
+          path: "/home/{{ ansible_user }}/.kube"
+          state: directory
+          mode: '0755'
+        become: true
+
+      - name: Copiar archivo de configuración de Kubernetes
+        copy:
+          src: /etc/kubernetes/admin.conf
+          dest: "/home/{{ ansible_user }}/.kube/config"
+          remote_src: yes
+          mode: '0644'
+        become: true
+
+      - name: Cambiar permisos del archivo de configuración
+        file:
+          path: "/home/{{ ansible_user }}/.kube/config"
+          owner: "{{ ansible_user_id }}"
+          group: "{{ ansible_user_gid }}"
+          mode: '0644'
+        become: true
+      
+      - name: Export KUBECONFIG
+        shell: export KUBECONFIG="/home/{{ ansible_user }}/.kube/config"
+
+      - name: Instalar Flannel
+        shell: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+        become: yes
+        become_user: ubuntu
+
+      - name: Obtener el token de kubeadm
+        shell: kubeadm token list | awk 'NR==2 {print $1}'
+        register: kubeadm_token_list
+
+      - name: Obtener el hash del certificado de la CA
+        shell: | 
+            openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | sha256sum | awk '{ print $1 }'
+        register: ca_cert_hash
+
+      - name: Obtener el ip local
+        shell: | 
+            ip -4 addr show $(ip route show default | awk '/default/ {print $5}') | awk '/inet / {print $2}' | cut -d/ -f1
+        register: local_ip
+
+      - name: Crear el comando kubeadm join
+        set_fact:
+          join_command: >
+            kubeadm join {{ local_ip.stdout }}:6443 --token {{ kubeadm_token_list.stdout }} --discovery-token-ca-cert-hash sha256:{{ ca_cert_hash.stdout }}
+
+      - name: Guardar comando join en un archivo
+        copy:
+          content: "{{ join_command }}"
+          dest: /home/{{ ansible_user }}/kubeadm_join_command.sh
+          mode: '0755'
+
+- hosts: worker
+  become: true
+  tasks:
+    - name: Verificar si el nodo ya está unido al clúster
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+    
+    - name: Leer el contenido del archivo en el host de master
+      shell: cat /home/{{ ansible_user }}/kubeadm_join_command.sh
+      register: kubeadm_join
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+
+    - name: Unir el worker al clúster
+      shell: "{{ kubeadm_join.stdout }}"
+      become: true
+      when: not kubelet_conf.stat.exists

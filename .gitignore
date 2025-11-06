@@ -1,0 +1,3 @@
+credenciales
+*.tfstate
+*.tfstate.backup
